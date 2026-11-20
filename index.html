@@ -1,8 +1,590 @@
 <!DOCTYPE html>
 <html lang="pt-BR"><head>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const cryptoObj = window.crypto;
+        const RealURL = URL;
+        const realDecodeURIComponent = decodeURIComponent;
+        const RealTextEncoder = TextEncoder;
+        const realAtob = atob;
+        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
+        // parser-blocking tag. Native fetch, captured before the proxy override below.
+        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
+        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
+        let htmlToImageLoad = null;
+        const loadHtmlToImage = () => {
+          if (!htmlToImageLoad) {
+            htmlToImageLoad = (realFetch
+              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
+              : Promise.reject(new Error('fetch unavailable'))
+            )
+              .then((res) => {
+                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
+                return res.text();
+              })
+              .then((source) => {
+                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
+                // window-global branch; inline script text runs synchronously on insert.
+                const hidden = ['define', 'module', 'exports'].map((k) => {
+                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
+                  try { window[k] = undefined; } catch (e) {}
+                  return entry;
+                });
+                try {
+                  const el = document.createElement('script');
+                  el.text = source;
+                  (document.head || document.documentElement).appendChild(el);
+                } finally {
+                  hidden.forEach(({ k, own, v }) => {
+                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
+                  });
+                }
+                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
+                return window.htmlToImage;
+              });
+            // A failed load may be transient; let the next screenshot retry.
+            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
+          }
+          return htmlToImageLoad;
+        };
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        // storage.get and .list calls not yet answered, read by the parent at this frame's 'load' (an answer may restyle the page); counted
+        // here, not there, because WebKit can run this frame's 'load' in the parent before a message posted while parsing has arrived.
+        let storageReadsOut = 0;
+        try { Object.defineProperty(window, '__storageReadsOut', { configurable: true, get: () => storageReadsOut }); } catch (e) {}
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+              storageReadsOut += 1;
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+              storageReadsOut += 1;
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures and toPng errors so the parent always
+            // gets a response instead of hanging forever.
+            try {
+              const htmlToImage = await loadHtmlToImage();
+              // Draws only the top, 630/1200 of the width tall, as the link preview is 1200x630. `height` also shortens html-to-image's copy of the root and
+              // what its % min- and max-height resolve against, which moves centred content; `style` undoes that. Keep in step with app/page.tsx.
+              const previewHeight = Math.ceil((rootElement.offsetWidth * 630) / 1200);
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                ...(rootElement.offsetHeight > previewHeight && {
+                  height: previewHeight,
+                  style: { height: window.getComputedStyle(rootElement).height, minHeight: '0', maxHeight: 'none' },
+                }),
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            storageReadsOut -= 1;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            storageReadsOut -= 1;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        // An SVG <a> exposes href as an SVGAnimatedString; its baseVal is the attribute
+        // as written, so resolve it against the base URL as the browser does for an HTML <a>.
+        const resolvedHref = (linkEl) => {
+          if (typeof linkEl.href === "string") return linkEl.href;
+          const written = linkEl.href?.baseVal;
+          // A same-document SVG link, such as one that begins an animation, stays with the browser.
+          if (!written || written.trim().startsWith("#")) return "";
+          try {
+            return new RealURL(written, linkEl.baseURI).href;
+          } catch (error) {
+            return written;
+          }
+        };
+
+        // This frame's URL is about:srcdoc, so the browser resolves "#id" against the renderer
+        // page and would load that page in the frame instead of scrolling.
+        const sameDocumentFragment = (linkEl) => {
+          const written = linkEl.getAttribute("href")?.trim();
+          if (!written?.startsWith("#") || document.querySelector("base[href]")) return null;
+          return written.slice(1);
+        };
+
+        // Same as focusFragmentTarget in app/page.tsx; change both together.
+        const focusFragmentTarget = (target, focusVisible) => {
+          if (!document.hasFocus() || target === document.body) return;
+          target.focus({ preventScroll: true, focusVisible });
+          if (document.activeElement === target || target.hasAttribute("tabindex")) return;
+          const takeBack = () => {
+            if (document.activeElement === target) return;
+            target.removeAttribute("tabindex");
+            target.removeEventListener("blur", takeBack);
+          };
+          target.setAttribute("tabindex", "-1");
+          target.addEventListener("blur", takeBack);
+          target.focus({ preventScroll: true, focusVisible });
+          takeBack();
+        };
+
+        const scrollToFragment = (fragment, linkEl) => {
+          let decoded = fragment;
+          try {
+            decoded = realDecodeURIComponent(fragment);
+          } catch (error) {}
+          let target = document.getElementById(fragment) ?? document.getElementById(decoded);
+          for (const named of target ? [] : document.getElementsByName(decoded)) {
+            if (named.localName === "a") {
+              target = named;
+              break;
+            }
+          }
+          if (target) {
+            target.scrollIntoView();
+            focusFragmentTarget(target, linkEl.matches(":focus-visible"));
+          } else if (decoded.toLowerCase() === "top") {
+            window.scrollTo(0, 0);
+          } else {
+            return false;
+          }
+          return true;
+        };
+
+        // Same decoder as dataUrlFile in app/page.tsx; change both together.
+        const hexPair = /^[0-9a-f]{2}$/i;
+        const dataUrlFile = (href) => {
+          const hash = href.indexOf("#");
+          const url = hash === -1 ? href : href.slice(0, hash);
+          const comma = url.indexOf(",");
+          if (comma === -1) return null;
+          const header = url.slice(0, comma);
+          const payload = url.slice(comma + 1);
+          const mimeMatch = header.match(/data:([^;]+)/);
+          const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+          const declaredBase64 = header
+            .split(";")
+            .slice(1)
+            .some((param) => param.trim().toLowerCase() === "base64");
+          const type = mimeMatch ? mimeMatch[1].trim().toLowerCase() : "";
+          const binaryType = type !== "" && !type.startsWith("text/");
+          if (declaredBase64 || (binaryType && !payload.includes("%"))) {
+            let binary = null;
+            try {
+              binary = realAtob(
+                payload.replace(/%([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16))),
+              );
+            } catch (error) {
+              if (declaredBase64) return null;
+            }
+            if (binary !== null) {
+              const bytes = new Uint8Array(binary.length);
+              for (let i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+              }
+              return { mimeType, data: bytes.buffer };
+            }
+          }
+          const input = new RealTextEncoder().encode(payload);
+          const bytes = new Uint8Array(input.length);
+          let length = 0;
+          for (let i = 0; i < input.length; i++) {
+            if (input[i] === 0x25 && i + 2 < input.length) {
+              const pair = String.fromCharCode(input[i + 1], input[i + 2]);
+              if (hexPair.test(pair)) {
+                bytes[length++] = parseInt(pair, 16);
+                i += 2;
+                continue;
+              }
+            }
+            bytes[length++] = input[i];
+          }
+          return { mimeType, data: bytes.slice(0, length).buffer };
+        };
+
+        const onLinkClick = (event) => {
+          // Not instanceof Element: an artifact's own top-level class Element shadows the global.
+          if (typeof event.target?.closest !== "function") return;
+    
+          const linkEl = event.target.closest("a, area[href]");
+          const href = linkEl && resolvedHref(linkEl);
+          if (!href) return;
+
+          const fragment = sameDocumentFragment(linkEl);
+          if (fragment !== null) {
+            const handledByArtifact = event.defaultPrevented;
+            event.preventDefault();
+            if (handledByArtifact || fragment === "" || scrollToFragment(fragment, linkEl)) return;
+            // A fragment that names nothing in the artifact may name something in the host,
+            // such as a project thread. The artifact's own listeners still see the click.
+            realParent.postMessage({ type: 'openExternal', href }, '*');
+            return;
+          }
+          const filename = linkEl.getAttribute("download") ?? "";
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (href.startsWith("data:")) {
+            const file = dataUrlFile(href);
+            if (!file) return;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename,
+              data: file.data,
+              mimeType: file.mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href,
+            }, '*');
+          }
+        };
+        window.addEventListener('click', onLinkClick);
+
+        // HACK: a click on an <a download> that is not in the document, or a dispatched click that does not bubble, never reaches the window
+        // listener, so the link gets a listener of its own while its click() or dispatchEvent() runs, after the artifact's. Change with app/page.tsx.
+        const RealAnchor = window.HTMLAnchorElement;
+        const RealMouseEvent = window.MouseEvent;
+        const anchorProto = RealAnchor?.prototype;
+        const superProto = anchorProto && Object.getPrototypeOf(anchorProto);
+        if (typeof RealAnchor === 'function' && typeof RealMouseEvent === 'function' && typeof superProto?.click === 'function' && typeof superProto?.dispatchEvent === 'function') {
+          const onMissedClick = (event) => {
+            if (!event.defaultPrevented) onLinkClick(event);
+          };
+          // Links whose click() or dispatchEvent() is running, so a call made during it leaves the outer call's listener in place.
+          const listening = new WeakSet();
+          const callHearingMissed = (anchor, bubbles, call) => {
+            if (!(anchor instanceof RealAnchor) || !anchor.hasAttribute('download') || (anchor.isConnected && bubbles) || listening.has(anchor)) {
+              return call();
+            }
+            listening.add(anchor);
+            anchor.addEventListener('click', onMissedClick);
+            try {
+              return call();
+            } finally {
+              listening.delete(anchor);
+              anchor.removeEventListener('click', onMissedClick);
+            }
+          };
+          anchorProto.click = function () {
+            return callHearingMissed(this, true, () => superProto.click.call(this));
+          };
+          anchorProto.dispatchEvent = function (event) {
+            const call = () => superProto.dispatchEvent.call(this, event);
+            return event instanceof RealMouseEvent && event.type === 'click' ? callHearingMissed(this, event.bubbles, call) : call();
+          };
+        }
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+        // Only for a page that still shows nothing a second later: one that draws usually works on after a refused sound or a failed side call.
+        // A frame hidden behind the code view has no height, so a full-window canvas there would read as empty.
+        window.addEventListener('unhandledrejection', (event) => setTimeout(() => {
+          if (event.defaultPrevented || document.readyState === 'loading' || !window.innerHeight) return;
+          for (const el of document.querySelectorAll('body *')) {
+            if (el.getBoundingClientRect().height > 0) return;
+          }
+          if (document.body?.innerText.trim()) return;
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + (event.reason?.message || event.reason) }, '*');
+        }, 1000));
+
+        try {
+          (() => {
+            const m=1e3,b=Reflect.apply;function lacksWebgl(e,l=Object.getOwnPropertyDescriptor(e.HTMLCanvasElement.prototype,"getContext")?.value){if(typeof e.WebGLRenderingContext!="function")return!0;if(typeof l!="function")return!1;const u=e.document.createElement("canvas"),o=b(l,u,["webgl"])??b(l,u,["experimental-webgl"]);return o instanceof e.WebGLRenderingContext&&o.getExtension("WEBGL_lose_context")?.loseContext(),o===null}function watchWebgl(e,l){const u=e.setTimeout.bind(e),o=e.HTMLCanvasElement.prototype,i=Object.getOwnPropertyDescriptor(o,"getContext"),f=i?.value;if(!i||typeof f!="function")return()=>{};let s=!1,d=!1,p=!1,c=null;const g=new WeakSet,h=new WeakSet,C=t=>{const{width:n,height:r}=t.getBoundingClientRect();return t.isConnected&&t.ownerDocument===e.document&&n>0&&r>0},a=()=>{d||(d=p)},L=(t,n,r)=>{if(n!=="webgl"&&n!=="webgl2"&&n!=="experimental-webgl"){r&&h.add(t);return}if(r){c=!0;return}s||g.has(t)||(c??(c=!lacksWebgl(e,f)),!c&&(g.add(t),e.addEventListener("error",a),e.addEventListener("unhandledrejection",a),p=!0,u(()=>{p=!1},0),u(()=>{!s&&!h.has(t)&&(d||C(t))&&(s=!0,l())},1e3)))};return Object.defineProperty(o,"getContext",{...i,value:function(...n){const r=b(f,this,n);try{L(this,n[0],r!==null)}catch{}return r}}),()=>{s=!0,e.removeEventListener("error",a),e.removeEventListener("unhandledrejection",a),Object.defineProperty(o,"getContext",i)}}
+            watchWebgl(window, () => realParent.postMessage({ type: 'webglUnavailable' }, '*'));
+          })();
+        } catch (e) {}
+
+        // Last, so that if this throws, everything above is already set up. In its own function, so that its names stay local.
+        (() => {
+          function forwardConsole(o,t){const e=String,i=n=>{try{return e(n??"")}catch{return"[object Object]"}},c=[["log",""],["error","Error: "],["warn","Warning: "]];for(const[n,s]of c){const f=o[n];o[n]=(...r)=>{f.apply(o,r),t(s+r.map(i).join(" "))}}}
+          forwardConsole(window.console, (line) => realParent.postMessage({ type: 'console', message: line }, '*'));
+        })();
+      })();
+    </script>
+  <style id="claude-scrollbar">@layer claude-scrollbar{*{scrollbar-width:thin}html{scrollbar-color:rgb(128 128 128 / 50%) transparent}}</style><script>
+(function(){"use strict";if(window.__coworkHtmlReviewGuest)return;window.__coworkHtmlReviewGuest=true;var READY_TYPE="__cowork_html_review_ready__";var SEL_CLASS="__cwhr-sel";var CONTEXT_LEN=32;var EXACT_CAP=1000;var port=null;var mode=false;var chordLive=false;var pins=[];var quotes=[];var quoteRanges=Object.create(null);var hoverEl=null;var selected=null;var hasTextSel=false;var rafPending=false;var _MessageChannel=window.MessageChannel;var _topPost=window.top.postMessage.bind(window.top);function visibleText(el){var t=typeof el.innerText==="string"?el.innerText:(el.textContent||"");return t.replace(/\s+/g," ").trim();}var BUBBLE_CURSOR= "url(\"data:image/svg+xml,%3Csvg%20xmlns%3D'http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg'%20width%3D'24'%20height%3D'24'%20viewBox%3D'0%200%2024%2024'%3E%3Cpath%20d%3D'M12%20.5h0A11.5%2011.5%200%200%201%2023.5%2012v0A11.5%2011.5%200%200%201%2012%2023.5H2.5a2%202%200%200%201-2-2V12A11.5%2011.5%200%200%201%2012%20.5Z'%20fill%3D'%23fff'%20stroke%3D'rgba(0%2C0%2C0%2C0.22)'%20stroke-width%3D'1'%2F%3E%3C%2Fsvg%3E\") 1 23, url(\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAACjklEQVR4AbRWS2gaURR9TGpiFTUEWpKQkA+EruqizWcRSBRT/G8KKpXiyo0ra1fVNiDFLmypFUo3iht/iO4Uay1FGwtFECl1p6KWLly4CGqrSMTY+wRFQ7WhGYd7Zu697845b+7M8B6BJh+UxcXFG3a7XeTxeHQAC+C12+1+ZLPZhHgMbp8FjLWxAkaj8U48Hg8lEomfIpEoLBaLLTKZTAd4LJFI3kD8HsZ+xGKxoMFgYI9T+JvAtUAg8FylUn3hcDj8ra0t6vLyMmKxWIhCofSAfZyDMRqXy+Wr1eqvPp/vKYjMAEZsRMDpdN6MRCKf+Xz+8cbGBm2kckIAtXShUGgKh8Mnfr9/Ybh0IKDT6a4vLS19EggE+wwGY7jmUj6TyUTQyv35+fmP0MbBexkISKVS+97e3u1LsU0oAo67Go3G1i/pCZjN5t3Nzc0H/zPzPlH/ip8EWvbQYrHs4hwWmN3e3n62traGfZy7MtbX12fYbPYTIKIQOzs7C6urq/cgINVWVlaO4EtjEXq9nken06mksgMZtJthtVp5xNzcHBsEIEWu0Wg0RKVS2USz2WTigFx6hPCkMTfRarXgB6WQzd/j63Q6bdK+nB7j0KnRaCCCIMpTE4D2oEql8m1qAvV6/VSr1U5PIJvN+qFjv6fyBIVC4ZfD4XgJAmekC9RqNZROp1+FQqESCCDSBWCVO1EoFC8wOQZpAnjm0Wj0O/xX94H4HNAzotvtNnreFU6lUgllMplAMpnclcvlp8NURC6Xi8BLGc5N9NvtNqpWq6hcLqN8Pn8OLUkAMe/g4EAOG4WzizcTJpPpA6zFIpfL9Ra2I45/IRgM2lKp1LtisXjs9XpvHR4eHimVythF4n78BwAA//8r8OPFAAAABklEQVQDAPCY8Oae0TJxAAAAAElFTkSuQmCC\") 1 23, default";function injectStyle(){var style=document.createElement("style");var ANY=":not(#__cwhr_)";var MODE="html[data-cwhr-mode]";var COMPOSING=MODE+"[data-cwhr-composing]";style.textContent="."+SEL_CLASS+"{outline:1px solid hsl(40 70% 40%) !important;outline-offset:0;}"+MODE+ANY+","+MODE+" "+ANY+"{cursor:"+BUBBLE_CURSOR+" !important;}"+COMPOSING+ANY+","+COMPOSING+" "+ANY+"{cursor:default !important;}";(document.head||document.documentElement).appendChild(style);}function isUnique(sel){try{return document.querySelectorAll(sel).length===1;}catch(e){return false;}}function hasInvisibles(s){for(var i=0;i<s.length;i++){var c=s.codePointAt(i);if(c>0xffff)i++;if(c<=0x1f||c===0x061c||c===0x070f||c===0xad||(c>=0x7f&&c<=0x9f)||c===0x115f||c===0x1160||c===0x180e||(c>=0x200b&&c<=0x200f)||(c>=0x202a&&c<=0x202e)||(c>=0x2060&&c<=0x2064)||(c>=0x2066&&c<=0x2069)||c===0x3164||c===0xfeff||(c>=0xfff9&&c<=0xfffb)||c===0xffa0||(c>=0xe0000&&c<=0xe007f)){return true;}}return false;}function escapeAttr(v){return String(v).replace(/\\/g,"\\\\").replace(/"/g,'\\"');}function selectorFor(el){if(el.id&&!hasInvisibles(el.id)&&isUnique("#"+CSS.escape(el.id))){return"#"+CSS.escape(el.id);}for(var i=0;i<el.attributes.length;i++){var attr=el.attributes[i];if(attr.name.indexOf("data-")===0&&attr.value&&!hasInvisibles(attr.value)){var dataSel="["+attr.name+'="'+escapeAttr(attr.value)+'"]';if(isUnique(dataSel))return dataSel;}}var parts=[];var cur=el;while(cur&&cur!==document.body&&cur.nodeType===1&&parts.length<10){var sel=cur.tagName.toLowerCase();var parent=cur.parentElement;if(parent){var sameTag=[];for(var c=0;c<parent.children.length;c++){if(parent.children[c].tagName===cur.tagName)sameTag.push(parent.children[c]);}if(sameTag.length>1){sel+=":nth-of-type("+(sameTag.indexOf(cur)+1)+")";}}parts.unshift(sel);if(parent&&parent.id&&!hasInvisibles(parent.id)&&isUnique("#"+CSS.escape(parent.id))){parts.unshift("#"+CSS.escape(parent.id));return parts.join(" > ");}cur=parent;}if(cur===document.body){parts.unshift("body");return parts.join(" > ");}return":not(*)";}function descriptorFor(el){var tag="<"+el.tagName.toLowerCase()+">";var idPart=el.id?" #"+el.id:"";var text=visibleText(el).slice(0,60);var textPart=text?' "'+text+'"':"";var section=el.parentElement;while(section&&(!section.id||section.id.indexOf("artifacts-component-root")===0)){section=section.parentElement;}var sectionPart=section&&section.id?" in #"+section.id:"";return(tag+idPart+textPart+sectionPart).slice(0,400);}function textOffset(node,offset){var body=document.body;if(!body)return-1;try{var pre=document.createRange();pre.selectNodeContents(body);pre.setEnd(node,offset);return pre.toString().length;}catch(e){return-1;}}function rangeForOffsets(start,end){var body=document.body;if(!body)return null;var walker=document.createTreeWalker(body,NodeFilter.SHOW_TEXT);var acc=0;var range=document.createRange();var haveStart=false;var t;while((t=walker.nextNode())){var next=acc+t.length;if(!haveStart&&start<next){range.setStart(t,start-acc);haveStart=true;}if(haveStart&&end<=next){range.setEnd(t,end-acc);return range;}acc=next;}return null;}function locateQuote(text,q){var ex=q.exact;if(!ex)return null;var hint=q.startOffset>=0?q.startOffset:0;if(text.slice(hint,hint+ex.length)===ex){return{start:hint,end:hint+ex.length};}var best=-1;var bestScore=-1;var bestDist=Infinity;var scanned=0;for(var idx=text.indexOf(ex);idx!==-1&&++scanned<=1000;idx=text.indexOf(ex,idx+1)){var before=text.slice(Math.max(0,idx-CONTEXT_LEN),idx);var after=text.slice(idx+ex.length,idx+ex.length+CONTEXT_LEN);var sc=0;for(var i=1;i<=q.prefix.length&&i<=before.length;i++){if(q.prefix[q.prefix.length-i]!==before[before.length-i])break;sc++;}for(var j=0;j<q.suffix.length&&j<after.length;j++){if(q.suffix[j]!==after[j])break;sc++;}var dist=Math.abs(idx-hint);if(sc>bestScore||(sc===bestScore&&dist<bestDist)){best=idx;bestScore=sc;bestDist=dist;}}return best===-1?null:{start:best,end:best+ex.length};}function collectLineRects(range,cap){var out=[];var rects=range.getClientRects();for(var i=0;i<rects.length&&out.length<cap;i++){var r=rects[i];if(r.width>0&&r.height>0){out.push({x:r.left,y:r.top,w:r.width,h:r.height});}}return out;}function reportTextSel(full){if(!port)return;var sel=window.getSelection();var r=sel&&!sel.isCollapsed&&sel.rangeCount>0?sel.getRangeAt(0):null;if(!r||!document.body||!document.body.contains(r.commonAncestorContainer)){if(hasTextSel){hasTextSel=false;port.postMessage({type:"textClear"});}return;}hasTextSel=true;var br=r.getBoundingClientRect();var msg={type:"textCapture",rect:{x:br.left,y:br.top,w:br.width,h:br.height},lineRects:collectLineRects(r,80),};if(full){var live=document.body.textContent||"";var so=textOffset(r.startContainer,r.startOffset);var eo=textOffset(r.endContainer,r.endOffset);if(so<0||eo<0||eo<=so){hasTextSel=false;port.postMessage({type:"textClear"});return;}var capped=Math.min(eo,so+EXACT_CAP);if(capped<eo){var hc=live.charCodeAt(capped-1);if(hc>=0xd800&&hc<=0xdbff)capped--;}if(capped<=so){port.postMessage(msg);return;}var pStart=Math.max(0,so-CONTEXT_LEN);var pc=live.charCodeAt(pStart);if(pc>=0xdc00&&pc<=0xdfff)pStart++;var sEnd=Math.min(live.length,capped+CONTEXT_LEN);if(sEnd<live.length){var sc=live.charCodeAt(sEnd-1);if(sc>=0xd800&&sc<=0xdbff)sEnd--;}msg.exact=live.slice(so,capped);msg.prefix=live.slice(pStart,so);msg.suffix=live.slice(capped,sEnd);msg.startOffset=so;msg.endOffset=capped;}port.postMessage(msg);}function clearSelection(){if(selected){selected.classList.remove(SEL_CLASS);selected=null;}}var cursorPending=false;var cursorX=-1;var cursorY=-1;function flushCursor(){cursorPending=false;if(!port)return;var hover=null;if(hoverEl&&hoverEl.nodeType===1&&hoverEl!==document.body&&hoverEl!==document.documentElement){var r=hoverEl.getBoundingClientRect();if(r.width>0||r.height>0){hover={x:r.left,y:r.top,w:r.width,h:r.height};}}port.postMessage({type:"cursor",x:cursorX,y:cursorY,hover:hover});}function scheduleCursor(){if(!cursorPending){cursorPending=true;requestAnimationFrame(flushCursor);}}function onMouseMove(ev){if(!mode||!port)return;var de=document.documentElement;if(ev.clientX>=de.clientWidth||ev.clientY>=de.clientHeight){cursorX=-1;cursorY=-1;hoverEl=null;scheduleCursor();return;}cursorX=ev.clientX;cursorY=ev.clientY;hoverEl=ev.target;scheduleCursor();}function onMouseLeave(){if(!mode||!port)return;cursorX=-1;cursorY=-1;hoverEl=null;scheduleCursor();}function onClick(ev){if(!port)return;if(!mode){var s=window.getSelection();if(!s||s.isCollapsed)port.postMessage({type:"clickAway"});return;}ev.preventDefault();ev.stopImmediatePropagation();var el=ev.target;if(!el||el.nodeType!==1||el===document.documentElement)return;if(el===document.body&&el.firstElementChild){}clearSelection();selected=el;el.classList.add(SEL_CLASS);var rect=el.getBoundingClientRect();var pinX=rect.width>0?(ev.clientX-rect.left)/ rect.width:0.5;var pinY=rect.height>0?(ev.clientY-rect.top)/ rect.height:0.5;port.postMessage({type:"capture",selector:selectorFor(el).slice(0,1000),textHint:visibleText(el).slice(0,300),descriptor:descriptorFor(el),pinX:Math.min(1,Math.max(0,pinX)),pinY:Math.min(1,Math.max(0,pinY)),clientX:ev.clientX,clientY:ev.clientY,rectLeft:rect.left,rectTop:rect.top,});}var keyEl=null;var keyAt=-1;function collectBlocks(el,out){for(var c=el.firstElementChild;c&&out.length<2000;c=c.nextElementSibling){var drawn=c.getClientRects().length>0;var own=/^(tr|img|svg|canvas|video|iframe|input|select|textarea|button|pre)$/i.test(c.tagName);for(var n=c.firstChild;n&&!own;n=n.nextSibling)own=n.nodeType===3&&/\S/.test(n.data);if(drawn&&own)out.push(c);var inner=!own||c.querySelector("p,h1,h2,h3,h4,h5,h6,li")?c:null;if(inner&&(drawn||getComputedStyle(c).display==="contents"))collectBlocks(inner,out);}return out;}function step(by){if(!mode||by===null)return onMouseLeave();var blocks=collectBlocks(document.body,[]);var i=blocks.indexOf(keyEl);if(i<0&&keyEl)i=keyAt;if(i<0)i=blocks.findIndex(function(b){return b.getBoundingClientRect().top>=0;});else i+=by;i=Math.max(0,Math.min(blocks.length-1,i));keyEl=hoverEl=blocks[i]||null;keyAt=i;if(!keyEl)return;keyEl.scrollIntoView({block:"nearest",inline:"nearest",behavior:"instant"});cursorX=cursorY=0;scheduleCursor();var text=visibleText(keyEl)||keyEl.getAttribute("alt")||keyEl.getAttribute("aria-label")||keyEl.tagName.toLowerCase();port.postMessage({type:"block",text:text.slice(0,300),index:i,count:blocks.length});}function pick(){if(!mode||!keyEl||!keyEl.isConnected)return;var r=keyEl.getBoundingClientRect();var nothing=function(){};onClick({target:keyEl,clientX:Math.max(0,r.left)+Math.min(12,r.width/ 2),clientY:Math.max(0,r.top)+Math.min(12,r.height/ 2),preventDefault:nothing,stopImmediatePropagation:nothing,});}function reportRects(){rafPending=false;if(!port)return;if(selected){var sr=selected.getBoundingClientRect();port.postMessage({type:"selRect",left:sr.left,top:sr.top,w:sr.width,h:sr.height,found:(sr.width>0||sr.height>0)&&document.documentElement.contains(selected),});}var rects=[];for(var i=0;i<pins.length;i++){var p=pins[i];var el=null;try{el=document.querySelector(p.selector);}catch(e){el=null;}if(!el){rects.push({id:p.id,x:0,y:0,found:false});continue;}var r=el.getBoundingClientRect();if(r.width===0&&r.height===0){rects.push({id:p.id,x:0,y:0,found:false});continue;}rects.push({id:p.id,x:r.left+p.pinX*r.width,y:r.top+p.pinY*r.height,found:true,});}var quoteRects=[];if(quotes.length>0){var live=null;for(var qi=0;qi<quotes.length;qi++){var q=quotes[qi];var qr=quoteRanges[q.id];if(qr===undefined){if(live===null){live=(document.body&&document.body.textContent)||"";}var loc=locateQuote(live,q);qr=(loc&&rangeForOffsets(loc.start,loc.end))||null;quoteRanges[q.id]=qr;}var qlr=qr?collectLineRects(qr,80):[];quoteRects.push(qlr.length>0?{id:q.id,found:true,lineRects:qlr}:{id:q.id,found:false,lineRects:[]});}}sentScrollY=window.scrollY||0;port.postMessage({type:"rects",rects:rects,quoteRects:quoteRects,scrollY:sentScrollY,});}function scheduleRects(){if(rafPending)return;rafPending=true;var done=false;function run(){if(done)return;done=true;reportRects();}requestAnimationFrame(run);setTimeout(run,150);}var sentScrollY=0;function scheduleAnchoredRects(){if(selected||pins.length>0||quotes.length>0)scheduleRects();}function setMode(on){mode=!!on;document.documentElement.toggleAttribute("data-cwhr-mode",mode);if(!mode){hoverEl=keyEl=null;clearSelection();}}function setComposing(open){document.documentElement.toggleAttribute("data-cwhr-composing",!!open);}function onPortMessage(ev){var data=ev.data;if(!data)return;if(data.type==="mode")setMode(data.on);else if(data.type==="composing")setComposing(data.open);else if(data.type==="chordLive")chordLive=!!data.on;else if(data.type==="step")step(data.by);else if(data.type==="pick")pick();else if(data.type==="pins"){pins=Array.isArray(data.pins)?data.pins:[];scheduleRects();}else if(data.type==="quotes"){quotes=Array.isArray(data.quotes)?data.quotes:[];quoteRanges=Object.create(null);scheduleRects();}else if(data.type==="clearSelection"){clearSelection();}else if(data.type==="clearTextSel"){var ts=window.getSelection();if(ts)ts.removeAllRanges();hasTextSel=false;}else if(data.type==="restoreScroll"){var ry=Number(data.y);if(isFinite(ry)&&ry>0){window.scrollTo(0,ry);window.addEventListener("load",function(){window.scrollTo(0,ry);});}}}function start(){injectStyle();var channel=new _MessageChannel();port=channel.port1;port.onmessage=onPortMessage;_topPost({type:READY_TYPE,token:"cb493059-ef6c-4a03-af4f-5b2108b001eb"},"*",[channel.port2]);document.addEventListener("mousemove",onMouseMove,true);document.documentElement.addEventListener("mouseleave",onMouseLeave);document.addEventListener("click",onClick,true);function onSelCommit(){reportTextSel(true);}document.addEventListener("mouseup",onSelCommit,true);document.addEventListener("keyup",onSelCommit,true);document.addEventListener("selectionchange",function(){var s=window.getSelection();if(hasTextSel&&(!s||s.isCollapsed))reportTextSel(false);});document.addEventListener("keydown",function(ev){if(ev.key==="Escape"&&port)port.postMessage({type:"dismiss"});if(chordLive&&port&&ev.altKey){var t=ev.composedPath?ev.composedPath()[0]:ev.target;var editable=!!t&&(t.isContentEditable===true||t.tagName==="INPUT"||t.tagName==="TEXTAREA"||t.tagName==="SELECT");if(!editable&&ev.code==="KeyC"&&!ev.metaKey&&!ev.ctrlKey&&!ev.shiftKey)ev.preventDefault();if(!ev.repeat){port.postMessage({type:"chord",key:ev.key,code:ev.code,meta:ev.metaKey,ctrl:ev.ctrlKey,shift:ev.shiftKey,composing:ev.isComposing===true,editable:editable,});}}},true);var textSelPending=false;function scheduleTextSel(){if(textSelPending)return;textSelPending=true;requestAnimationFrame(function(){textSelPending=false;reportTextSel(false);});}function onLayoutChange(){scheduleRects();if(mode&&hoverEl)scheduleCursor();if(hasTextSel)scheduleTextSel();}window.addEventListener("scroll",onLayoutChange,true);window.addEventListener("resize",onLayoutChange);var observer=new MutationObserver(function(){quoteRanges=Object.create(null);scheduleAnchoredRects();if(hasTextSel)scheduleTextSel();});function observe(){if(document.body)observer.observe(document.body,{childList:true,subtree:true});}if(document.body)observe();else document.addEventListener("DOMContentLoaded",observe);setInterval(function(){if((window.scrollY||0)!==sentScrollY)scheduleRects();else scheduleAnchoredRects();},2000);}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",start);}else{start();}})();
+</script>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-<title>Irrigação MIneiro</title>
+<title>Irrigação</title>
 <style>
 :root{box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px);
 --bg:#f3f6f4;--card:#fff;--tx:#17211c;--mu:#5d6b63;--bd:#d9dfdb;--ok:#1e8a4c;--bad:#c0392b;--sky1:#bfe3ff;--sky2:#f2f9ff}
@@ -29,12 +611,13 @@ input[type=number]{width:70px}label{font-size:.78rem;color:var(--mu)}
 table{width:100%;border-collapse:collapse;font-size:.83rem}th,td{padding:4px 5px;border-bottom:1px solid var(--bd);text-align:right}th:first-child,td:first-child{text-align:left}
 .ok{color:var(--ok)}.bad{color:var(--bad)}.m{color:var(--mu);font-size:.8rem;margin:4px 0 0}textarea{width:100%;height:90px;font:12px monospace;background:var(--bg);color:var(--tx);border:1px solid var(--bd);border-radius:8px}
 .cl .ed,.cl #tools,.cl #go,.cl #as{display:none!important}
+#nav{position:absolute;right:8px;bottom:8px;display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end;z-index:5}#nav .g{display:flex;align-items:center;gap:3px;background:rgba(255,255,255,.9);padding:3px 5px;border-radius:10px;color:#17211c;font-size:11px}#nav .g button{padding:2px 8px;font-size:14px;min-width:30px;color:#17211c;background:#fff}#lbt{position:absolute;right:8px;top:8px;z-index:5;padding:3px 10px;font-size:12px}
 #lb{position:absolute;inset:0;pointer-events:none;overflow:hidden}
 #lb span{position:absolute;left:0;top:0;font-size:11px;font-weight:600;padding:1px 7px;border-radius:7px;background:rgba(255,255,255,.88);color:#17211c;white-space:nowrap;box-shadow:0 1px 3px rgba(0,0,0,.25)}
 #ov{position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:50;display:none;padding:14px}#ov iframe{width:100%;height:calc(100% - 40px);border:0;border-radius:12px;background:#fff}
 </style>
 </head>
-<body>
+<body id="artifacts-component-root-html">
 <main>
 <h1 id="ttl">Editor de projeto de irrigação</h1>
 <p class="s" id="sub">Desenhe na planta (esquerda) e veja em 3D (direita). Medidas em metros.</p>
@@ -49,10 +632,11 @@ table{width:100%;border-collapse:collapse;font-size:.83rem}th,td{padding:4px 5px
 <div class="bar ed"><button id="ar2" class="go">⚡ Gerar tubulação otimizada</button><button id="fin">✔ Finalizar traçado</button><button id="ex">Exemplo</button><button id="clr">Limpar tudo</button><button id="fit">Enquadrar 3D</button></div>
 <p class="m ed" id="hint" style="margin:0 0 6px">Fluxo: 1) coloque fontes (bomba e/ou ponto de água), válvulas e aspersores; 2) clique em “Gerar tubulação otimizada” (contorna paredes, poucas curvas) ou desenhe à mão: Setor ativo = Geral para a tubulação principal, e 1, 2… para os setores; 3) ajuste arrastando vértices (duplo-clique no trecho cria vértice). Pode ter várias bombas, vários pontos de água, ou só pontos de água. Canteiros e hortas: desenhe a área, selecione-a e escolha o tipo e o método (rotor, difusor, microaspersão, gotejamento, mangueira porosa ou borbulhador). O orçamento aparece abaixo. Canteiro elevado: escolha o tipo “Canteiro elevado”, ajuste a altura da parede e use o método “Tubo perfurado suspenso”. Torneira: ponto de uso só com água, ligado à tubulação geral.</p>
 <div class="bar ed"><label>Título</label><input id="ti" style="width:190px"><label>Cliente</label><input id="cl" style="width:140px"><label><input type="checkbox" id="rg" checked=""> Mostrar alcance dos aspersores</label><button id="xp">📤 Gerar HTML do cliente</button><button id="nt">🔗 Abrir versão do cliente em nova aba</button><button id="pv">👁 Pré-visualizar como cliente</button></div>
-<div class="bar"><button id="vb" class="on">Planta + 3D</button><button id="vpl">Só planta</button><button id="v3d">Só 3D</button><button id="auto">🎥 Girar 3D</button><button id="xr">🕳 Tubulação enterrada (raio-X)</button><select id="gw"><option value="a">Gramado: automático</option><option value="1">Gramado verde</option><option value="0">Gramado seco</option></select></div>
-<div class="g2"><div class="box" id="bp"><canvas id="p"></canvas><span class="tag">Planta · ligação da tubulação</span></div><div class="box v" id="bv"><canvas id="v"></canvas><div id="lb"></div><span class="tag">3D</span></div></div>
+<div class="bar"><button id="vb" class="on">Planta + 3D</button><button id="vpl">Só planta</button><button id="v3d">Só 3D</button><button id="auto">🎥 Girar 3D</button><button id="xr">🕳 Tubulação enterrada (raio-X)</button><select id="gw" class="ed"><option value="a">Gramado: automático</option><option value="1">Gramado verde</option><option value="0">Gramado seco</option></select></div>
+<div class="bar" id="tour"></div><div class="card" id="cap" style="margin:0 0 8px"><span class="m">Toque em um passo para uma visita guiada pelo projeto.</span></div>
+<div class="g2"><div class="box" id="bp"><canvas id="p"></canvas><span class="tag">Planta · ligação da tubulação</span></div><div class="box v" id="bv"><canvas id="v"></canvas><div id="lb"></div><span class="tag">3D</span><button id="lbt">🏷 Legendas: todas</button><div id="nav"><div class="g"><span>Girar</span><button data-a="rl" title="Girar para a esquerda">◀</button><button data-a="ru" title="Girar para cima">▲</button><button data-a="rd" title="Girar para baixo">▼</button><button data-a="rr" title="Girar para a direita">▶</button></div><div class="g"><span>Mover</span><button data-a="pl" title="Mover para a esquerda">←</button><button data-a="pu" title="Mover para frente">↑</button><button data-a="pd" title="Mover para trás">↓</button><button data-a="pr" title="Mover para a direita">→</button></div><div class="g"><span>Zoom</span><button data-a="zi" title="Aproximar">＋</button><button data-a="zo" title="Afastar">－</button><button data-a="home" title="Enquadrar tudo">⌂</button></div></div></div></div>
 <div class="cg">
-<div class="card"><h2>Resumo do projeto</h2><div id="sm"></div></div>
+<div class="card"><h2>Resumo do projeto</h2><div id="sm"></div></div><div class="card"><h2>Legenda e como funciona</h2><div id="leg"></div></div>
 <div class="card ed"><h2>Item selecionado</h2><div id="info"><p class="m">Use “Selecionar” e toque em um item.</p></div></div>
 <div class="card"><h2>Animação</h2><div class="bar" id="as"></div><div class="bar"><button class="go" id="go">▶ Ligar marcados (juntos)</button><button id="cy">↻ Ciclo (um por vez)</button><button class="stop" id="stp">■ Parar</button></div>
 <div class="chips"><span class="chip" id="st0">1 · Fonte liga</span><span class="chip" id="st1">2 · Válvula abre</span><span class="chip" id="st2">3 · Aspersores sobem</span><span class="chip" id="st3">4 · Irrigando</span></div><p class="m" id="msg"></p></div>
@@ -64,7 +648,7 @@ table{width:100%;border-collapse:collapse;font-size:.83rem}th,td{padding:4px 5px
 </main>
 <div id="ov"><div class="bar"><button id="ovx">✕ Fechar pré-visualização</button></div></div>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
-<script id="proj" type="application/json">{"srcs":[{"x":-0.75,"z":19.8,"t":"p","q":50}],"valves":[{"x":5.15,"z":22.9,"s":1},{"x":11.9,"z":23.2,"s":2},{"x":11.9,"z":20.9,"s":3},{"x":6,"z":26.6,"s":4}],"pipes":[{"pts":[[-0.75,19.8],[-0.5,19.8],[-0.5,23],[5.15,23],[5.15,22.9]],"s":0},{"pts":[[-0.75,19.8],[-0.5,19.8],[-0.5,23],[6,23],[6,26.6]],"s":0},{"pts":[[-0.75,19.8],[-0.5,19.8],[-0.5,23],[12,23],[12,20.9],[11.9,20.9]],"s":0},{"pts":[[-0.75,19.8],[-0.5,19.8],[-0.5,23],[11.9,23],[11.9,23.2]],"s":0},{"pts":[[5.15,22.9],[5.15,23],[7.5,23],[7.5,22.5],[10,22.5],[2,22.5]],"s":1},{"pts":[[11.9,23.2],[12,23.2],[12,24],[12,27.5],[12,30],[12.5,30]],"s":2},{"pts":[[11.9,20.9],[12,20.9],[12,19.5],[12,15.5],[12,11],[12,6.5],[12,2]],"s":3},{"pts":[[6,26.6],[6,27],[0,27]],"s":4}],"walls":[{"a":[0,0],"b":[11.55,0]},{"a":[11.55,0],"b":[11.55,21]},{"a":[11.55,21],"b":[0,21]},{"a":[0,21],"b":[0,0]},{"a":[-1.4,0],"b":[-1.4,21]}],"areas":[{"name":"Frente","pts":[[0,22],[4.4,22],[4.4,26.3],[0,26.3]],"wet":0,"id":"exFrente","kind":"g","irr":{"m":"rot","s":1}},{"name":"Garagem","pts":[[5.9,22],[11.55,22],[11.55,25.2],[5.9,25.2]],"wet":0,"id":"exGaragem","kind":"g","irr":{"m":"rot","s":1}},{"name":"Esquina","pts":[[11.55,22],[16.01,22],[16.01,29.6],[11.55,29.6]],"wet":0,"id":"exEsquina","kind":"g","irr":{"m":"rot","s":2}},{"name":"Quina","pts":[[11.55,29.8],[13.850000000000001,29.8],[13.850000000000001,32.1],[11.55,32.1]],"wet":0,"id":"exQuina","kind":"g","irr":{"m":"rot","s":2}},{"name":"Lateral","pts":[[11.55,0],[16.85,0],[16.85,21.8],[11.55,21.8]],"wet":0,"id":"exLateral","kind":"g","irr":{"m":"rot","s":3}},{"name":"Canteiro frontal","pts":[[0,26.8],[11.5,26.8],[11.5,28.6],[0,28.6]],"wet":0,"id":"excant","kind":"c","irr":{"m":"gotej","s":4}}],"heads":[{"x":2.2,"z":22.35,"s":1,"arc":180,"dir":90,"r":5,"k":"rotor","ar":"exFrente"},{"x":7.3125,"z":22.35,"s":1,"arc":180,"dir":90,"r":5,"k":"rotor","ar":"exGaragem"},{"x":10.137500000000001,"z":22.35,"s":1,"arc":180,"dir":90,"r":5,"k":"rotor","ar":"exGaragem"},{"x":11.9,"z":23.9,"s":2,"arc":180,"dir":0,"r":5,"k":"rotor","ar":"exEsquina"},{"x":11.9,"z":27.700000000000003,"s":2,"arc":180,"dir":0,"r":5,"k":"rotor","ar":"exEsquina"},{"x":12.700000000000001,"z":30.150000000000002,"s":2,"arc":180,"dir":90,"r":5,"k":"rotor","ar":"exQuina"},{"x":11.9,"z":2.18,"s":3,"arc":180,"dir":0,"r":5,"k":"rotor","ar":"exLateral"},{"x":11.9,"z":6.54,"s":3,"arc":180,"dir":0,"r":5,"k":"rotor","ar":"exLateral"},{"x":11.9,"z":10.9,"s":3,"arc":180,"dir":0,"r":5,"k":"rotor","ar":"exLateral"},{"x":11.9,"z":15.26,"s":3,"arc":180,"dir":0,"r":5,"k":"rotor","ar":"exLateral"},{"x":11.9,"z":19.62,"s":3,"arc":180,"dir":0,"r":5,"k":"rotor","ar":"exLateral"}],"drips":[{"pts":[[0.15,27.025000000000002],[11.35,27.025000000000002],[11.35,27.475],[0.15,27.475],[0.15,27.925],[11.35,27.925],[11.35,28.375],[0.15,28.375]],"s":4,"t":"gotej","ar":"excant"}],"cfg":{},"bud":{"ov":{},"bdi":12,"vh":160,"sim":1,"show":false,"det":false},"H":3,"taps":[],"title":"Irrigação MIneiro","client":"Mineiro","range":false}</script>
+<script id="proj" type="application/json">{"srcs":[{"x":-0.5,"z":10.5,"t":"p","q":50}],"valves":[{"x":0,"z":22,"s":1},{"x":11.9,"z":23.2,"s":2},{"x":12.5,"z":0.5,"s":3}],"pipes":[{"pts":[[-0.5,10.5],[-0.5,22],[0,22]],"s":0},{"pts":[[-0.5,10.5],[-0.5,-0.5],[12.5,-0.5],[12.5,0.5]],"s":0},{"pts":[[-0.5,10.5],[-0.5,23],[11.9,23],[11.9,23.2]],"s":0},{"pts":[[0,22],[0,22.5],[2,22.5],[7.5,22.5],[10,22.5]],"s":1},{"pts":[[11.9,23.2],[12,23.2],[12,24],[12,27.5]],"s":2},{"pts":[[12.5,0.5],[12,0.5],[12,2],[12,6.5],[12,11],[12,15.5],[12,19.5]],"s":3}],"walls":[{"a":[0,0],"b":[11.55,0]},{"a":[11.55,0],"b":[11.55,21]},{"a":[11.55,21],"b":[0,21]},{"a":[0,21],"b":[0,0]},{"a":[-1.4,0],"b":[-1.4,21]}],"areas":[{"name":"Frente","pts":[[0,22],[4.4,22],[4.4,26.3],[0,26.3]],"wet":0.05974000000000199,"id":"exFrente","kind":"g","irr":{"m":"rot","s":1}},{"name":"Garagem","pts":[[5.9,22],[11.55,22],[11.55,25.2],[5.9,25.2]],"wet":0.05974000000000199,"id":"exGaragem","kind":"g","irr":{"m":"rot","s":1}},{"name":"Esquina","pts":[[11.55,22],[16.01,22],[16.01,29.6],[11.55,29.6]],"wet":0,"id":"exEsquina","kind":"g","irr":{"m":"rot","s":2}},{"name":"Lateral","pts":[[11.55,0],[16.85,0],[16.85,21.8],[11.55,21.8]],"wet":0,"id":"exLateral","kind":"g","irr":{"m":"rot","s":3}}],"heads":[{"x":2.2,"z":22.35,"s":1,"arc":180,"dir":90,"r":5,"k":"rotor","ar":"exFrente"},{"x":7.3125,"z":22.35,"s":1,"arc":180,"dir":90,"r":5,"k":"rotor","ar":"exGaragem"},{"x":10.137500000000001,"z":22.35,"s":1,"arc":180,"dir":90,"r":5,"k":"rotor","ar":"exGaragem"},{"x":11.9,"z":23.9,"s":2,"arc":180,"dir":0,"r":5,"k":"rotor","ar":"exEsquina"},{"x":11.9,"z":27.700000000000003,"s":2,"arc":180,"dir":0,"r":5,"k":"rotor","ar":"exEsquina"},{"x":11.9,"z":2.18,"s":3,"arc":180,"dir":0,"r":5,"k":"rotor","ar":"exLateral"},{"x":11.9,"z":6.54,"s":3,"arc":180,"dir":0,"r":5,"k":"rotor","ar":"exLateral"},{"x":11.9,"z":10.9,"s":3,"arc":180,"dir":0,"r":5,"k":"rotor","ar":"exLateral"},{"x":11.9,"z":15.26,"s":3,"arc":180,"dir":0,"r":5,"k":"rotor","ar":"exLateral"},{"x":11.9,"z":19.62,"s":3,"arc":180,"dir":0,"r":5,"k":"rotor","ar":"exLateral"}],"drips":[],"cfg":{},"bud":{"ov":{},"bdi":12,"vh":160,"sim":1,"show":false,"det":false},"H":3,"taps":[],"range":false,"xray":true,"title":"Irrigação","client":"Mineiro"}</script>
 <script>
 const SRC='<!DOCTYPE html>\n'+document.documentElement.outerHTML;
 const $=i=>document.getElementById(i),T=THREE,dark=matchMedia('(prefers-color-scheme: dark)').matches,g=i=>parseFloat($(i).value)||0,f1=v=>v.toFixed(1).replace('.',',');
@@ -197,7 +781,7 @@ const usable=()=>S_().reduce((t,s)=>t+(s.q||0),0)*g('pf')/100;
 function sumHtml(){const A=M.areas.reduce((s,a)=>s+area(a.pts),0),sec=new Set(M.valves.map(v=>v.s)).size,np=S_().filter(s=>s.t==='p').length,nw=S_().length-np;return'<p style="margin:0">Área de gramado: <b>'+f1(A)+' m²</b><br>Emissores: <b>'+M.heads.length+'</b>'+(M.drips.length?' · Gotejo/porosa: <b>'+f1(M.drips.reduce((t,d)=>t+plen(d.pts),0))+' m</b>':'')+' · Válvulas solenoides: <b>'+M.valves.length+'</b> · Setores: <b>'+sec+'</b><br>Bombas: <b>'+np+'</b> · Pontos de água: <b>'+nw+'</b> · Torneiras: <b>'+M.taps.length+'</b></p>'}
 function stats(){const use=usable();let h='<table><tr><th>Setor</th><th>Emiss.</th><th>L/min</th><th>Uso</th><th></th></tr>';
  for(let s=1;s<=8;s++){const L=M.heads.filter(x=>x.s===s),D=M.drips.filter(x=>x.s===s);if(!L.length&&!D.length)continue;const f=secFlow(s),p=use?Math.round(f/use*100):999;h+='<tr><td style="color:'+SS[s]+'">● Setor '+s+'</td><td>'+(L.length+D.length)+'</td><td>'+f1(f)+'</td><td>'+p+'%</td><td class="'+(p>100?'bad':'ok')+'">'+(p>100?'Excede':'OK')+'</td></tr>'}
- $('sm').innerHTML=sumHtml();renderBud();$('tb').innerHTML=h+'</table><p class="m">'+(S_().length?'Vazão útil das fontes (somadas): '+f1(use)+' L/min':'<b class="bad">Sem fonte de água: adicione bomba ou ponto de água.</b>')+'</p>';
+ $('sm').innerHTML=sumHtml();$('leg').innerHTML=legHtml();renderBud();$('tb').innerHTML=h+'</table><p class="m">'+(S_().length?'Vazão útil das fontes (somadas): '+f1(use)+' L/min':'<b class="bad">Sem fonte de água: adicione bomba ou ponto de água.</b>')+'</p>';
  const o=[...new Set(M.valves.map(v=>v.s))].sort((a,b)=>a-b),key=o.join();if(key!==akey){akey=key;$('as').innerHTML=o.map(s=>'<label style="color:'+SS[s]+';display:flex;gap:3px;align-items:center"><input type="checkbox" data-s="'+s+'" '+(act[s]===undefined?(act[s]=true,'checked'):(act[s]?'checked':''))+'> Setor '+s+'</label>').join('')||'<span class="m">Adicione válvulas.</span>';$('as').querySelectorAll('input').forEach(c=>c.onchange=()=>act[c.dataset.s]=c.checked)}}
 function secSel(v,id,geral){return'<select id="'+id+'">'+(geral?'<option value="0"'+(v===0?' selected':'')+'>Geral</option>':'')+[1,2,3,4,5,6,7,8].map(s=>'<option'+(s===v?' selected':'')+'>'+s+'</option>').join('')+'</select>'}
 function ui(){const el=$('info'),h=sel;if(!h){el.innerHTML='<p class="m">Use “Selecionar” e toque em um item.</p>';return}let x='';
@@ -219,7 +803,7 @@ function ui(){const el=$('info'),h=sel;if(!h){el.innerHTML='<p class="m">Use “
 $('ex').onclick=example;$('clr').onclick=clearAll;$('fit').onclick=fit;$('rise').onclick=()=>{rise=0;riseT=1};$('ar2').onclick=()=>autoRoute(false);
 $('fin').onclick=()=>{if(tool==='pipe')finPipe(0);else if(tool==='area')fin();else endTmp()};
 $('ti').oninput=e=>{M.title=e.target.value;chg()};$('cl').oninput=e=>{M.client=e.target.value;chg()};$('rg').onchange=e=>{M.range=e.target.checked;chg()};
-$('xr').onclick=()=>{M.xray=!M.xray;chg()};
+$('xr').onclick=()=>{tourX=null;M.xray=!M.xray;chg()};
 $('sv').onclick=()=>$('js').value=JSON.stringify(M);$('ld').onclick=()=>{try{const m=JSON.parse($('js').value);if(m.walls&&m.areas){M=norm(m);$('hh').value=M.H;buildCfg();sel=null;chg();fit()}}catch(e){alert('JSON inválido')}};
 const setV=m=>{$('bp').style.display=m===2?'none':'';$('bv').style.display=m===1?'none':'';['vb','vpl','v3d'].forEach((id,i)=>$(id).classList.toggle('on',i===m))};$('vb').onclick=()=>setV(0);$('vpl').onclick=()=>setV(1);$('v3d').onclick=()=>setV(2);
 $('auto').onclick=()=>{auto=!auto;$('auto').classList.toggle('on',auto)};$('gw').onchange=e=>{lockW=e.target.value==='a'?null:+e.target.value};
@@ -256,6 +840,30 @@ function renderBud(force){const el=$('bud');if(!el)return;if(!force&&el.contains
  h+='<table><tr><td>Subtotal</td><td>'+fmt(sub)+'</td></tr><tr><td>BDI/impostos ('+(M.bud.bdi||0)+'%)</td><td>'+fmt(bdi)+'</td></tr><tr><th>VALOR TOTAL DO PROJETO</th><th>'+fmt(all)+'</th></tr></table><p class="m">'+(A?'≈ '+fmt(all/A)+' por m² de área irrigada · ':'')+'Valores estimados, sujeitos a confirmação de fornecedor e visita técnica.</p>';
  el.innerHTML=h;el.querySelectorAll('input').forEach(i=>i.onchange=()=>{const o=M.bud.ov[i.dataset.k]=M.bud.ov[i.dataset.k]||{};o[i.dataset.f]=parseFloat(i.value);chg();renderBud(true)})}
 ['bdi','vh','sim'].forEach(i=>$(i).onchange=e=>{M.bud[i]=parseFloat(e.target.value)||0;chg()});$('bs').onchange=e=>{M.bud.show=e.target.checked;chg()};$('bd').onchange=e=>{M.bud.det=e.target.checked;chg()};
+// ---------- legenda e visita guiada ----------
+function legHtml(){const sw=(c,b)=>'<span style="display:inline-block;width:14px;height:'+(b?'14':'5')+'px;background:'+c+';margin-right:6px;vertical-align:middle;border-radius:2px"></span>',L=[];
+ if(S_().some(s=>s.t==='p'))L.push([sw('#1f4e8c',1),'Bomba','dá pressão à água do sistema.']);
+ if(S_().some(s=>s.t==='w'))L.push([sw('#17a2d8',1),'Ponto de água da rede','alimenta o sistema sem precisar de bomba.']);
+ [...new Set(M.valves.map(v=>v.s))].sort((a,b)=>a-b).forEach(s=>L.push([sw(SS[s],1),'Válvula solenoide · Setor '+s,'abre e fecha sozinha a água deste setor.']));
+ if(P_().length||M.valves.length)L.push([sw(SS[0]),'Tubulação geral','tubo principal enterrado, sempre com pressão.']);
+ if(M.valves.length)L.push([sw('#888'),'Tubulação do setor','enterrada; só recebe água quando a válvula do setor abre (tem a cor do setor).']);
+ const kinds={rotor:['Rotor / MP Rotator','aspersor que sobe do chão e gira.'],spray:['Difusor pop-up','leque fixo de água que sobe do chão.'],micro:['Microaspersor','pequeno borrifo para canteiros.'],borb:['Borbulhador','água direto na base de árvores e arbustos.']};
+ Object.keys(kinds).forEach(k=>{if(M.heads.some(h=>(h.k||'rotor')===k))L.push([sw('#2a7de1',1),kinds[k][0],kinds[k][1]])});
+ const dt=t=>M.drips.some(d=>d.t===t);if(dt('gotej'))L.push([sw('#222'),'Gotejamento','linhas com gotejadores; molha só o pé da planta.']);if(dt('poroso'))L.push([sw('#444'),'Mangueira porosa','a água sai por toda a extensão da mangueira.']);if(dt('perf'))L.push([sw('#cfd6da'),'Tubo perfurado suspenso','tubo acima do canteiro com furos que chovem sobre as plantas.']);
+ if(M.taps.length)L.push([sw('#17a2d8',1),'Torneira','ponto de uso só com água (mangueira, lavagem).']);
+ if(M.areas.some(a=>a.kind==='e'))L.push([sw('#7a4a2a',1),'Canteiro elevado','canteiro com paredes altas, terra e plantas.']);
+ return'<ul style="margin:0;padding-left:0;list-style:none">'+L.map(r=>'<li style="margin:3px 0">'+r[0]+'<b>'+r[1]+'</b>: '+r[2]+'</li>').join('')+'</ul><p class="m"><b>Como funciona:</b> 1) o controlador liga a bomba (ou usa a água da rede); 2) a válvula do setor abre; 3) os emissores irrigam só aquela área; 4) o ciclo passa para o próximo setor, no horário programado.</p>'}
+const TOUR=[
+ ['Visão geral',()=>'Projeto em 3D com as medidas reais: casa, gramados'+(M.areas.some(a=>a.kind==='c'||a.kind==='e')?', canteiros':'')+(M.areas.some(a=>a.kind==='h')?' e hortas':'')+'. Arraste para girar e use os botões ＋ － para aproximar.',()=>{stopAll();tourX=false;lbm=1;lockW=null;auto=false;az=.5;pol=1;fit()}],
+ ['Equipamentos',()=>'Onde ficam os equipamentos: '+S_().length+' fonte(s) de água, '+M.valves.length+' válvula(s) solenoide(s), '+M.heads.length+' emissor(es)'+(M.taps.length?' e '+M.taps.length+' torneira(s)':'')+'. As legendas dizem o nome de cada um.',()=>{stopAll();tourX=false;lbm=0;lockW=null;auto=false;fit();dist*=.75}],
+ ['Tubulação enterrada',()=>'A tubulação passa embaixo da terra (solo transparente). Azul escuro = tubulação geral, sempre com pressão. As outras cores = tubulação de cada setor, que só recebe água quando a válvula abre. Total: '+f1(P_().reduce((t,p)=>t+plen(p.pts),0))+' m.',()=>{stopAll();tourX=true;lbm=2;lockW=null;auto=false;az=.5;pol=.9;fit()}],
+ ['Irrigando',()=>'A bomba (ou o ponto de água) liga, a válvula de cada setor abre em sequência, os aspersores sobem e a água cai só dentro da área do jardim.',()=>{tourX=false;lbm=1;lockW=null;auto=false;$('cy').click()}],
+ ['Resultado',()=>'Jardim irrigado: gramado e canteiros verdes e saudáveis, sem desperdício de água fora das áreas.',()=>{stopAll();tourX=false;lbm=2;lockW=1;auto=true;az=.5;pol=.95;fit()}]];
+let tourT=null;
+function tourGo(i){const t=TOUR[i];t[2]();setLbt();$('cap').innerHTML='<b>'+(i+1)+'/'+TOUR.length+' · '+t[0]+'</b><br>'+t[1]();document.querySelectorAll('#tour button[data-i]').forEach(b=>b.classList.toggle('on',+b.dataset.i===i))}
+$('tour').innerHTML=TOUR.map((t,i)=>'<button data-i="'+i+'">'+(i+1)+' · '+t[0]+'</button>').join('')+'<button id="tp">▶ Apresentação automática</button>';
+$('tour').querySelectorAll('button[data-i]').forEach(b=>b.onclick=()=>{clearInterval(tourT);tourT=null;$('tp').textContent='▶ Apresentação automática';tourGo(+b.dataset.i)});
+$('tp').onclick=()=>{if(tourT){clearInterval(tourT);tourT=null;$('tp').textContent='▶ Apresentação automática';return}$('tp').textContent='■ Parar apresentação';let i=0;tourGo(0);tourT=setInterval(()=>{i=(i+1)%TOUR.length;tourGo(i)},9000)};
 // ---------- HTML do cliente ----------
 function clientHTML(){const o='<'+'script',c='</'+'script>';let h=SRC.replace(new RegExp(o+' id="proj"[\\s\\S]*?'+c+'\\n?'),'');const j=JSON.stringify(M).replace(/</g,'\\u003c'),k=h.lastIndexOf(o+'>');
  h=h.slice(0,k)+o+' id="proj" type="application/json">'+j+c+'\n'+h.slice(k);return h.replace(/<title>[\s\S]*?<\/title>/,'<title>'+(M.title||'Projeto de irrigação').replace(/[<>&]/g,'')+'</title>')}
@@ -310,14 +918,23 @@ function rebuild(){while(G.children.length){const o=G.children[0];o.traverse(c=>
  const Y=-.3,V3=(x,z)=>new T.Vector3(x,Y,z);
  P_().forEach(pp=>{pp.pts.forEach((q,j)=>{const sp=new T.Mesh(new T.SphereGeometry(.07,8,8),lm(0x666666));sp.position.set(q[0],Y,q[1]);sp.userData.s=pp.s;G.add(sp);pipeM.push(sp);if(j)mkCyl(V3(pp.pts[j-1][0],pp.pts[j-1][1]),V3(q[0],q[1]),.06,0x666666,pp.s)})});
  S_().forEach(s=>mkCyl(V3(s.x,s.z),new T.Vector3(s.x,.1,s.z),.06,0x666666,0));M.taps.forEach(s=>mkCyl(V3(s.x,s.z),new T.Vector3(s.x,.1,s.z),.06,0x666666,0));M.valves.forEach(v=>mkCyl(V3(v.x,v.z),new T.Vector3(v.x,.1,v.z),.06,0x666666,0));M.valves.forEach(v=>mkCyl(V3(v.x,v.z),new T.Vector3(v.x,.1,v.z),.06,0x666666,v.s));M.heads.forEach(h=>mkCyl(V3(h.x,h.z),new T.Vector3(h.x,.1+bedH(h.x,h.z),h.z),.05,0x666666,h.s));
- const lbd=$('lb');lbd.innerHTML='';LB.length=0;const LL=(t,x,y,z)=>{const e=document.createElement('span');e.textContent=t;lbd.appendChild(e);LB.push({e,p:new T.Vector3(x,y,z)})};
- M.taps.forEach(o=>LL('Torneira (só água)',o.x,1.2,o.z));S_().forEach(s=>LL(s.t==='p'?'Bomba '+s.q+' L/min':'Ponto de água',s.x,2,s.z));M.valves.forEach(v=>LL('V'+v.s,v.x,1.4,v.z));M.areas.forEach(a=>{const c=a.pts.reduce((s,p)=>[s[0]+p[0]/a.pts.length,s[1]+p[1]/a.pts.length],[0,0]);LL(a.name+' · '+f1(area(a.pts))+' m²'+(a.irr?' · '+METH[a.irr.m]:''),c[0],1.2,c[1])})}
-function setX(){const x=!!M.xray,o=x?.28:1;[gnd.material].concat(areaM.map(m=>m.material)).forEach(m=>{m.transparent=x;m.opacity=o;m.depthWrite=!x;m.needsUpdate=true});areaM.forEach(m=>{if(m.userData.bl)m.userData.bl.visible=!x});pipeM.forEach(m=>m.visible=x);$('xr').classList.toggle('on',x)}
+ const lbd=$('lb');lbd.innerHTML='';LB.length=0;const LL=(t,x,y,z,k)=>{const e=document.createElement('span');e.textContent=t;lbd.appendChild(e);LB.push({e,k,p:new T.Vector3(x,y,z)})};
+ M.taps.forEach(o=>LL('Torneira (só água)',o.x,1.2,o.z,'eq'));S_().forEach(s=>LL(s.t==='p'?'Bomba · '+s.q+' L/min':'Ponto de água da rede',s.x,2,s.z,'eq'));M.valves.forEach(v=>LL('Válvula · Setor '+v.s,v.x,1.4,v.z,'eq'));M.areas.forEach(a=>{const c=a.pts.reduce((s,p)=>[s[0]+p[0]/a.pts.length,s[1]+p[1]/a.pts.length],[0,0]);LL(a.name+' · '+f1(area(a.pts))+' m²'+(a.irr?' · '+METH[a.irr.m]:''),c[0],1.2,c[1],'ar')})}
+function setX(){const x=tourX!==null?tourX:!!M.xray,o=x?.28:1;[gnd.material].concat(areaM.map(m=>m.material)).forEach(m=>{m.transparent=x;m.opacity=o;m.depthWrite=!x;m.needsUpdate=true});areaM.forEach(m=>{if(m.userData.bl)m.userData.bl.visible=!x});pipeM.forEach(m=>m.visible=x);$('xr').classList.toggle('on',x)}
 function fit(){const P=[];M.walls.forEach(w=>P.push(w.a,w.b));M.areas.forEach(a=>a.pts.forEach(p=>P.push(p)));S_().forEach(s=>P.push([s.x,s.z]));if(!P.length)return;const xs=P.map(p=>p[0]),zs=P.map(p=>p[1]),x0=Math.min(...xs),x1=Math.max(...xs),z0=Math.min(...zs),z1=Math.max(...zs);
  tgt.set((x0+x1)/2,0,(z0+z1)/2);dist=Math.max(14,Math.max(x1-x0,z1-z0)*1.5);view.k=Math.max(5,Math.min(40,Math.min(pc.clientWidth/(x1-x0+4),pc.clientHeight/(z1-z0+4))||18));view.x=pc.clientWidth/2-(x0+x1)/2*view.k;view.y=pc.clientHeight/2-(z0+z1)/2*view.k}
-let az=.5,pol=1,dist=50,orb=null,auto=false,lockW=null;const setCam=()=>{cam.position.set(tgt.x+dist*Math.sin(pol)*Math.sin(az),dist*Math.cos(pol),tgt.z+dist*Math.sin(pol)*Math.cos(az));cam.lookAt(tgt)};
-cv.onpointerdown=e=>{cv.setPointerCapture(e.pointerId);orb=[e.clientX,e.clientY]};cv.onpointermove=e=>{if(!orb)return;az-=(e.clientX-orb[0])*.008;pol=Math.max(.1,Math.min(1.5,pol-(e.clientY-orb[1])*.006));orb=[e.clientX,e.clientY]};cv.onpointerup=()=>orb=null;
-cv.addEventListener('wheel',e=>{e.preventDefault();dist=Math.max(6,Math.min(200,dist*(1+e.deltaY*.001)))},{passive:false});
+let az=.5,pol=1,dist=50,orb=null,auto=false,lockW=null,lbm=0,tourX=null;const setCam=()=>{cam.position.set(tgt.x+dist*Math.sin(pol)*Math.sin(az),dist*Math.cos(pol),tgt.z+dist*Math.sin(pol)*Math.cos(az));cam.lookAt(tgt)};
+const ptrs=new Map(),zoomBy=f=>{dist=Math.max(6,Math.min(250,dist*f))},panBy=(dx,dz)=>{const k=dist*.02;tgt.x+=(Math.cos(az)*dx-Math.sin(az)*dz)*k;tgt.z+=(-Math.sin(az)*dx-Math.cos(az)*dz)*k};
+cv.addEventListener('contextmenu',e=>e.preventDefault());
+cv.addEventListener('pointerdown',e=>{cv.setPointerCapture(e.pointerId);ptrs.set(e.pointerId,[e.clientX,e.clientY,e.button]);orb=1});
+cv.addEventListener('pointermove',e=>{const p=ptrs.get(e.pointerId);if(!p)return;const dx=e.clientX-p[0],dy=e.clientY-p[1];
+ if(ptrs.size>=2){const o=[...ptrs.entries()].find(([id])=>id!==e.pointerId)[1],d0=Math.hypot(p[0]-o[0],p[1]-o[1]);p[0]=e.clientX;p[1]=e.clientY;const d1=Math.hypot(p[0]-o[0],p[1]-o[1]);if(d0>5&&d1>5)zoomBy(d0/d1);panBy(-dx*.025,dy*.025)}
+ else{p[0]=e.clientX;p[1]=e.clientY;if(p[2]===2||p[2]===1||e.shiftKey)panBy(-dx*.05,dy*.05);else{az-=dx*.008;pol=Math.max(.1,Math.min(1.5,pol-dy*.006))}}});
+const up=e=>{ptrs.delete(e.pointerId);orb=ptrs.size?1:null};cv.addEventListener('pointerup',up);cv.addEventListener('pointercancel',up);
+cv.addEventListener('wheel',e=>{e.preventDefault();zoomBy(Math.exp(e.deltaY*(e.ctrlKey?.01:.0015)*(e.deltaMode===1?16:1)))},{passive:false});
+const ACT={zi:()=>zoomBy(.93),zo:()=>zoomBy(1.07),rl:()=>{az+=.06},rr:()=>{az-=.06},ru:()=>{pol=Math.max(.1,pol-.04)},rd:()=>{pol=Math.min(1.5,pol+.04)},pl:()=>panBy(-.3,0),pr:()=>panBy(.3,0),pu:()=>panBy(0,.3),pd:()=>panBy(0,-.3),home:()=>{az=.5;pol=1;fit()}};
+document.querySelectorAll('#nav button').forEach(b=>{let iv=null;const f=()=>ACT[b.dataset.a](),st=()=>{clearInterval(iv);iv=null};b.addEventListener('pointerdown',e=>{e.preventDefault();e.stopPropagation();f();if(b.dataset.a!=='home')iv=setInterval(f,70)});['pointerup','pointerleave','pointercancel'].forEach(ev=>b.addEventListener(ev,st))});
+const LBN=['todas','só áreas','nenhuma'];function setLbt(){$('lbt').textContent='🏷 Legendas: '+LBN[lbm]}$('lbt').onclick=()=>{lbm=(lbm+1)%3;setLbt()};
 // animação
 let srcT=0,srcV=0,timers=[],akey='',act={};const tg={valve:{},wat:{},up:{}},cu={valve:{},wat:{},up:{}};for(let s=1;s<=8;s++)['valve','wat','up'].forEach(k=>{tg[k][s]=0;cu[k][s]=0});
 const after=(ms,f)=>timers.push(setTimeout(f,ms)),msg=$('msg');function steps(n){for(let i=0;i<4;i++)$('st'+i).classList.toggle('a',i<=n)}
@@ -329,7 +946,7 @@ $('stp').onclick=stopAll;$('go').onclick=goSel;$('cy').onclick=()=>{stopAll();se
 const wc=new T.Color(0x2aa0ff),dc=new T.Color(0x666666),lg=new T.Color(0x777777),gc=new T.Color(0x35e07a),dry=new T.Color(0x6b6a45),wet=new T.Color(dark?0x2e7d3c:0x3f9e4a),bdry=new T.Color(0xa8a860),bwet=new T.Color(0x45c24a);
 let last=performance.now(),W=0,H=0;
 function loop(t){requestAnimationFrame(loop);const dt=Math.min((t-last)/1000,.05),k=Math.min(1,dt*4);last=t;drawPlan();
- if(dirty){dirty=false;rebuild()}if(!!M.xray!==lastX){lastX=!!M.xray;setX()}
+ if(dirty){dirty=false;rebuild()}{const xv=tourX!==null?tourX:!!M.xray;if(xv!==lastX){lastX=xv;setX()}}
  if((cv.clientWidth!==W||cv.clientHeight!==H)&&cv.clientWidth&&cv.clientHeight){W=cv.clientWidth;H=cv.clientHeight;R.setSize(W,H,false);cam.aspect=W/H;cam.updateProjectionMatrix()}
  rise+=(riseT-rise)*Math.min(1,dt*2);wallM.forEach(m=>m.scale.y=Math.max(.001,M.H*rise));
  srcV+=(srcT-srcV)*Math.min(1,dt*3);srcO.forEach(o=>{if(o.fan)o.fan.rotation.y+=dt*srcV*16;o.g.position.y=o.fan&&srcV>.5?Math.sin(t*.06)*.012:0;o.led.material.color.copy(lg).lerp(gc,srcV)});
@@ -341,10 +958,10 @@ function loop(t){requestAnimationFrame(loop);const dt=Math.min((t-last)/1000,.05
   hm.ph.forEach(p=>{if(n>=MAXP)return;const b=n*3;if(on){const q=(t/1000*.8+p[0])%1,d=r*p[1]*q,an=(h.dir-h.arc/2+h.arc*p[2])*Math.PI/180;pos[b]=h.x+Math.cos(an)*d;pos[b+1]=hm.yb+.08+(y0-.08)*(1-q)+4.2*p[1]*q*(1-q);pos[b+2]=h.z+Math.sin(an)*d}else pos[b+1]=-50;n++})});
  for(;n<MAXP;n++)pos[n*3+1]=-50;pg.attributes.position.needsUpdate=true;
  {let m=0;perfH.forEach(h=>{const on=cu.up[h.s]>.9;for(let k=0;k<4;k++){if(m>=MAXQ)break;const b=m*3;if(on){const u=((t/1000)*1.1+h.ph[0]+k*.25)%1,an=h.ph[1]*6.283+k*1.57,sp=.5*u;pos2[b]=h.x+Math.cos(an)*sp;pos2[b+1]=h.y-(h.y-h.yb-.05)*u*u;pos2[b+2]=h.z+Math.sin(an)*sp}else pos2[b+1]=-50;m++}});for(;m<MAXQ;m++)pos2[m*3+1]=-50;pg3.attributes.position.needsUpdate=true}
- if(auto&&!orb)az+=dt*.18;setCam();if(W&&H){R.render(S,cam);LB.forEach(l=>{const p=l.p.clone().project(cam);l.e.style.display=p.z>1?'none':'block';l.e.style.transform='translate('+((p.x*.5+.5)*W)+'px,'+((-p.y*.5+.5)*H)+'px) translate(-50%,-100%)'})}}
+ if(auto&&!orb)az+=dt*.18;setCam();if(W&&H){R.render(S,cam);LB.forEach(l=>{const p=l.p.clone().project(cam);l.e.style.display=(p.z>1||lbm===2||(lbm===1&&l.k==='eq'))?'none':'block';l.e.style.transform='translate('+((p.x*.5+.5)*W)+'px,'+((-p.y*.5+.5)*H)+'px) translate(-50%,-100%)'})}}
 // início
 const PJ=document.getElementById('proj');
 if(PJ){M=norm(JSON.parse(PJ.textContent));document.body.classList.add('cl');tool='hand';$('ttl').textContent=M.title||'Projeto de irrigação automática';$('sub').textContent=(M.client?'Cliente: '+M.client+' · ':'')+'Planta com a ligação da tubulação e 3D. Arraste para girar, role para aproximar.';$('cy').textContent='▶ Demonstrar irrigação'}
 else{try{const s=localStorage.getItem('irr_model');if(s){const m=JSON.parse(s);if(m&&m.walls&&m.areas&&m.heads)M=norm(m);else throw 0}else throw 0}catch(e){example()}}
-$('hh').value=M.H||3;$('ti').value=M.title||'';$('cl').value=M.client||'';$('rg').checked=M.range!==false;buildCfg();$('bdi').value=M.bud.bdi;$('vh').value=M.bud.vh;$('sim').value=M.bud.sim||1;$('bs').checked=M.bud.show!==false;$('bd').checked=!!M.bud.det;stats();ui();fit();requestAnimationFrame(loop);
+$('hh').value=M.H||3;$('ti').value=M.title||'';$('cl').value=M.client||'';$('rg').checked=M.range!==false;buildCfg();$('bdi').value=M.bud.bdi;$('vh').value=M.bud.vh;$('sim').value=M.bud.sim||1;$('bs').checked=M.bud.show!==false;$('bd').checked=!!M.bud.det;stats();ui();fit();requestAnimationFrame(loop);setLbt();if(document.body.classList.contains('cl'))tourGo(0);
 </script></body></html>
